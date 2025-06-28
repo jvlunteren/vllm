@@ -44,7 +44,19 @@ def find_seq_idx(query_start_len_ptr, target_idx, num_seqs,
         else:
             right = mid
 
-    return left - 1
+    seq_idx = left - 1
+
+    q_start_idx = tl.load(query_start_len_ptr + seq_idx)
+    q_end_idx = tl.load(query_start_len_ptr + seq_idx + 1)
+    q_len = q_end_idx - q_start_idx
+
+
+    if use_q_block_mode:
+        q_block_start_idx = q_start_idx // BLOCK_Q + seq_idx
+        q_block_local_idx = target_idx - q_block_start_idx
+        return seq_idx, q_start_idx, q_len, q_block_local_idx
+    else:
+        return seq_idx, q_start_idx, q_len, target_idx - q_start_idx
 
 
 @triton.jit
@@ -89,19 +101,7 @@ def kernel_unified_attention_2d(
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
 
-    seq_idx = find_seq_idx(query_start_len_ptr, q_block_global_idx, num_seqs,
-                           BLOCK_Q, True)
-
-    q_block_start_idx = tl.load(query_start_len_ptr +
-                                seq_idx) // BLOCK_Q + seq_idx
-
-    q_block_local_idx = q_block_global_idx - q_block_start_idx
-
-    cur_batch_in_all_start_index = tl.load(query_start_len_ptr + seq_idx)
-    cur_batch_in_all_stop_index = tl.load(query_start_len_ptr + seq_idx + 1)
-
-    cur_batch_query_len = cur_batch_in_all_stop_index \
-        - cur_batch_in_all_start_index
+    seq_idx, cur_batch_in_all_start_index, cur_batch_query_len, q_block_local_idx = find_seq_idx(query_start_len_ptr, q_block_global_idx, num_seqs, BLOCK_Q, True)
 
     if q_block_local_idx * BLOCK_Q >= cur_batch_query_len:
         return
@@ -145,7 +145,7 @@ def kernel_unified_attention_2d(
                               mask=query_mask_1,
                               other=0.0)
 
-    num_blocks = cdiv_fn(seq_len, BLOCK_SIZE)
+    num_blocks = cdiv_fn(tl.minimum(context_len + q_block_local_idx * BLOCK_Q + (BLOCK_M - 1)//num_queries_per_kv + 1, seq_len), BLOCK_SIZE)
 
     # iterate through tiles
     for j in range(0, num_blocks):
@@ -297,19 +297,7 @@ def kernel_unified_attention_3d(
     kv_head_idx = tl.program_id(1)
     segm_idx = tl.program_id(2)
 
-    seq_idx = find_seq_idx(query_start_len_ptr, q_block_global_idx, num_seqs,
-                           BLOCK_Q, True)
-
-    q_block_start_idx = tl.load(query_start_len_ptr +
-                                seq_idx) // BLOCK_Q + seq_idx
-
-    q_block_local_idx = q_block_global_idx - q_block_start_idx
-
-    cur_batch_in_all_start_index = tl.load(query_start_len_ptr + seq_idx)
-    cur_batch_in_all_stop_index = tl.load(query_start_len_ptr + seq_idx + 1)
-
-    cur_batch_query_len = cur_batch_in_all_stop_index \
-        - cur_batch_in_all_start_index
+    seq_idx, cur_batch_in_all_start_index, cur_batch_query_len, q_block_local_idx = find_seq_idx(query_start_len_ptr, q_block_global_idx, num_seqs, BLOCK_Q, True)
 
     if q_block_local_idx * BLOCK_Q >= cur_batch_query_len:
         return
@@ -317,11 +305,19 @@ def kernel_unified_attention_3d(
     # sequence len for this particular sequence
     seq_len = tl.load(seq_lens_ptr + seq_idx)
 
+    # context length for this particular sequences
+    context_len = seq_len - cur_batch_query_len
+
+    num_blocks = cdiv_fn(tl.minimum(context_len + q_block_local_idx * BLOCK_Q + (BLOCK_M - 1)//num_queries_per_kv + 1, seq_len), BLOCK_SIZE)
+
     # number of segments for this particular sequence
     num_segments = NUM_SEGMENTS_PER_SEQ
     blocks_per_segment = cdiv_fn(seq_len, num_segments * BLOCK_SIZE)
 
     if segm_idx * blocks_per_segment * BLOCK_SIZE >= seq_len:
+        return
+
+    if segm_idx * blocks_per_segment > num_blocks:
         return
 
     offs_m = tl.arange(0, BLOCK_M)
@@ -353,8 +349,6 @@ def kernel_unified_attention_3d(
     L = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, HEAD_SIZE_PADDED], dtype=tl.float32)
 
-    # context length for this particular sequences
-    context_len = seq_len - cur_batch_query_len
 
     # alibi slope for this head
     if USE_ALIBI_SLOPES:
@@ -362,7 +356,6 @@ def kernel_unified_attention_3d(
                               mask=query_mask_1,
                               other=0.0)
 
-    num_blocks = cdiv_fn(seq_len, BLOCK_SIZE)
 
     # iterate through tiles within current segment
     for j in range(
@@ -499,18 +492,20 @@ def reduce_segments(
     query_token_idx = tl.program_id(0)
     query_head_idx = tl.program_id(1)
 
-    seq_idx = find_seq_idx(query_start_len_ptr, query_token_idx, num_seqs,
-                           BLOCK_Q, False)
+    seq_idx, q_start_idx, q_len, q_idx = find_seq_idx(query_start_len_ptr, query_token_idx, num_seqs, BLOCK_Q, False)
 
     # sequence len for this particular sequence
     seq_len = tl.load(seq_lens_ptr + seq_idx)
+
+    # context length for this particular sequences
+    context_len = seq_len - q_len
 
     # number of segments for this particular sequence
     num_segments = NUM_SEGMENTS_PER_SEQ
     blocks_per_segment = cdiv_fn(seq_len, num_segments * BLOCK_SIZE)
 
     # create masks for subsequent loads
-    act_num_segments = cdiv_fn(seq_len, blocks_per_segment * BLOCK_SIZE)
+    act_num_segments = cdiv_fn(context_len + q_idx + 1, blocks_per_segment * BLOCK_SIZE)
     segm_mask = tl.arange(0, NUM_SEGMENTS_PER_SEQ) < tl.full(
         [NUM_SEGMENTS_PER_SEQ], act_num_segments, dtype=tl.int32)
     dim_mask = tl.where(tl.arange(0, HEAD_SIZE_PADDED) < HEAD_SIZE, 1,
