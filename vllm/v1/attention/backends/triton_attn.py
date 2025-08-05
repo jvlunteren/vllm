@@ -41,6 +41,7 @@ class TritonAttentionMetadata:
     num_actual_tokens: int  # Number of tokens excluding padding.
     max_query_len: int
     query_start_loc: torch.Tensor
+    num_decodes: int
     max_seq_len: int
     seq_lens: torch.Tensor
     block_table: torch.Tensor
@@ -102,6 +103,11 @@ class TritonAttentionMetadataBuilder(
         max_seq_len = int(common_attn_metadata.seq_lens_cpu.max())
         query_start_loc = common_attn_metadata.query_start_loc
         seq_lens = common_attn_metadata.seq_lens
+        if max_query_len == 1:
+            num_decodes = len(seq_lens)
+        else:
+            num_decodes = torch.argmax((torch.diff(query_start_loc) != 1).int()).item()
+
         block_table_tensor = common_attn_metadata.block_table_tensor
         slot_mapping = common_attn_metadata.slot_mapping
 
@@ -127,6 +133,7 @@ class TritonAttentionMetadataBuilder(
             num_actual_tokens=num_actual_tokens,
             max_query_len=max_query_len,
             query_start_loc=query_start_loc,
+            num_decodes=num_decodes,
             max_seq_len=max_seq_len,
             seq_lens=seq_lens,
             block_table=block_table_tensor,
@@ -343,6 +350,7 @@ class TritonAttentionImpl(AttentionImpl):
                 query = query.reshape((num_tokens, num_heads, head_size))
 
         cu_seqlens_q = attn_metadata.query_start_loc
+        num_decodes = attn_metadata.num_decodes
         seqused_k = attn_metadata.seq_lens
         max_seqlen_q = attn_metadata.max_query_len
         max_seqlen_k = attn_metadata.max_seq_len
@@ -378,6 +386,7 @@ class TritonAttentionImpl(AttentionImpl):
                 out=output[:num_actual_tokens],
                 cu_seqlens_q=cu_seqlens_q,
                 max_seqlen_q=max_seqlen_q,
+                num_decodes=num_decodes,
                 seqused_k=seqused_k,
                 max_seqlen_k=max_seqlen_k,
                 softmax_scale=self.scale,
