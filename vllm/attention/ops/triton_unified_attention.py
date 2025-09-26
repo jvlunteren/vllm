@@ -31,20 +31,16 @@ def apply_softcap(S, x):
 
 
 @triton.jit
-def find_seq_idx(query_start_len_ptr, target_idx, num_seqs,
-                 BLOCK_Q: tl.constexpr, use_q_block_mode: tl.constexpr):
+def find_seq_idx(boundary_ptr, target_idx, num_seqs):
     left: tl.int32 = 0
     right = num_seqs
     while left < right:
         mid = (left + right) // 2
-        val = tl.load(query_start_len_ptr + mid)
-        mid_val = val // BLOCK_Q + mid if use_q_block_mode else val
-
-        if mid_val <= target_idx:
+        val = tl.load(boundary_ptr + mid)
+        if val <= target_idx:
             left = mid + 1
         else:
             right = mid
-
     return left - 1
 
 
@@ -93,6 +89,7 @@ def kernel_unified_attention_2d(
     BLOCK_Q: tl.constexpr,  # int
     num_seqs: tl.int32,
     BLOCK_M: tl.constexpr,  # int
+    block_q_seq_boundaries_ptr, # [num_prefills]
     USE_FP8: tl.constexpr,  # bool
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
@@ -100,11 +97,9 @@ def kernel_unified_attention_2d(
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
 
-    seq_idx = find_seq_idx(query_start_len_ptr, q_block_global_idx, num_seqs,
-                           BLOCK_Q, True)
+    seq_idx = find_seq_idx(block_q_seq_boundaries_ptr, q_block_global_idx, num_seqs)
 
-    q_block_start_idx = tl.load(query_start_len_ptr +
-                                seq_idx) // BLOCK_Q + seq_idx
+    q_block_start_idx = tl.load(block_q_seq_boundaries_ptr + seq_idx)
 
     q_block_local_idx = q_block_global_idx - q_block_start_idx
 
@@ -351,26 +346,9 @@ def kernel_unified_attention_3d(
         BLOCK_M: tl.constexpr,  # int
         NUM_SEGMENTS_PER_SEQ: tl.constexpr,  # int
 ):
-    q_block_global_idx = tl.program_id(0)
+    seq_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
     segm_idx = tl.program_id(2)
-
-    seq_idx = find_seq_idx(query_start_len_ptr, q_block_global_idx, num_seqs,
-                           BLOCK_Q, True)
-
-    q_block_start_idx = tl.load(query_start_len_ptr +
-                                seq_idx) // BLOCK_Q + seq_idx
-
-    q_block_local_idx = q_block_global_idx - q_block_start_idx
-
-    cur_batch_in_all_start_index = tl.load(query_start_len_ptr + seq_idx)
-    cur_batch_in_all_stop_index = tl.load(query_start_len_ptr + seq_idx + 1)
-
-    cur_batch_query_len = cur_batch_in_all_stop_index \
-        - cur_batch_in_all_start_index
-
-    if q_block_local_idx * BLOCK_Q >= cur_batch_query_len:
-        return
 
     # sequence len for this particular sequence
     seq_len = tl.load(seq_lens_ptr + seq_idx)
@@ -385,16 +363,16 @@ def kernel_unified_attention_3d(
     offs_m = tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, HEAD_SIZE_PADDED)
     offs_t = tl.arange(0, TILE_SIZE)
-    query_pos = q_block_local_idx * BLOCK_Q + offs_m // num_queries_per_kv
+    query_pos = offs_m // num_queries_per_kv
 
-    query_offset_0 = cur_batch_in_all_start_index + query_pos
+    query_offset_0 = seq_idx + query_pos
     query_offset_1 = kv_head_idx * num_queries_per_kv + \
         offs_m % num_queries_per_kv
     query_offset = (query_offset_0[:, None] * query_stride_0 +
                     query_offset_1[:, None] * query_stride_1 + offs_d[None, :])
 
     dim_mask = tl.where(offs_d < HEAD_SIZE, 1, 0).to(tl.int1)
-    query_mask_0 = tl.where(query_pos < cur_batch_query_len, 1, 0).to(tl.int1)
+    query_mask_0 = tl.where(query_pos < 1, 1, 0).to(tl.int1)
     query_mask_1 = tl.where(query_offset_1 < num_query_heads, 1, 0).to(tl.int1)
 
     # Q : (BLOCK_M, HEAD_SIZE_PADDED)
@@ -422,7 +400,7 @@ def kernel_unified_attention_3d(
     acc = tl.zeros([BLOCK_M, HEAD_SIZE_PADDED], dtype=tl.float32)
 
     # context length for this particular sequences
-    context_len = seq_len - cur_batch_query_len
+    context_len = seq_len - 1
 
     # alibi slope for this head
     if USE_ALIBI_SLOPES:
@@ -435,19 +413,7 @@ def kernel_unified_attention_3d(
         qq_bias_row_ptrs = (qq_bias_ptr + query_pos[:, None] * qq_bias_stride_0
                             )  # shape: [BLOCK_M]
 
-    # compute the length of the longest sequence prefix spanned by any
-    # query token in the current q_block (q_block_local_idx)
-    max_seq_prefix_len = context_len + q_block_local_idx * BLOCK_Q + (
-        BLOCK_M - 1) // num_queries_per_kv + 1
-
-    # adjust for potential padding in the last q_block by considering the
-    # actual sequence length
-    max_seq_prefix_len = tl.minimum(max_seq_prefix_len, seq_len)
-
-    # calculate the number of tiles that need to be processed to
-    # cover the longest sequence prefix (due to causal masking, tiles beyond
-    # this prefix can be skipped)
-    num_tiles = cdiv_fn(max_seq_prefix_len, TILE_SIZE)
+    num_tiles = cdiv_fn(seq_len, TILE_SIZE)
 
     # iterate through tiles within current segment
     for j in range(
@@ -455,7 +421,7 @@ def kernel_unified_attention_3d(
             min((segm_idx + 1) * tiles_per_segment, num_tiles),
     ):
         seq_offset = j * TILE_SIZE + offs_t
-        tile_mask = seq_offset < max_seq_prefix_len
+        tile_mask = seq_offset < seq_len
 
         physical_block_idx = tl.load(block_tables_ptr + block_table_offset +
                                      seq_offset // BLOCK_SIZE).to(tl.int64)
@@ -597,11 +563,8 @@ def reduce_segments(
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
 ):
-    query_token_idx = tl.program_id(0)
+    seq_idx = tl.program_id(0)
     query_head_idx = tl.program_id(1)
-
-    seq_idx = find_seq_idx(query_start_len_ptr, query_token_idx, num_seqs,
-                           BLOCK_Q, False)
 
     # sequence len for this particular sequence
     seq_len = tl.load(seq_lens_ptr + seq_idx)
@@ -618,7 +581,7 @@ def reduce_segments(
                         0).to(tl.int1)
 
     # load segment maxima
-    segm_offset = (query_token_idx.to(tl.int64) *
+    segm_offset = (seq_idx.to(tl.int64) *
                    (num_query_heads * NUM_SEGMENTS_PER_SEQ) +
                    query_head_idx * NUM_SEGMENTS_PER_SEQ +
                    tl.arange(0, NUM_SEGMENTS_PER_SEQ))
@@ -636,7 +599,7 @@ def reduce_segments(
 
     # load, rescale, and add segment attention outputs
     segm_output_offset = (
-        query_token_idx.to(tl.int64) *
+        seq_idx.to(tl.int64) *
         (num_query_heads * NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED) +
         query_head_idx * (NUM_SEGMENTS_PER_SEQ * HEAD_SIZE_PADDED) +
         tl.arange(0, NUM_SEGMENTS_PER_SEQ)[:, None] * HEAD_SIZE_PADDED +
@@ -656,7 +619,7 @@ def reduce_segments(
         acc = tl.clamp(acc, FP8_MIN, FP8_MAX)
 
     # write result
-    output_offset = (query_token_idx * output_stride_0 +
+    output_offset = (seq_idx * output_stride_0 +
                      query_head_idx * output_stride_1 +
                      tl.arange(0, HEAD_SIZE_PADDED))
     tl.store(output_ptr + output_offset, acc, mask=dim_mask)
@@ -679,6 +642,10 @@ def unified_attention(
     q_descale,
     k_descale,
     v_descale,
+    BLOCK_M,
+    BLOCK_Q,
+    num_q_blocks,
+    block_q_seq_boundaries,
     alibi_slopes=None,
     output_scale=None,
     qq_bias=None,
@@ -703,20 +670,13 @@ def unified_attention(
     num_queries_per_kv = num_query_heads // num_kv_heads
     head_size = q.shape[2]
 
-    BLOCK_M = 16 if num_queries_per_kv <= 16 else triton.next_power_of_2(
-        num_queries_per_kv)
-    BLOCK_Q = BLOCK_M // num_queries_per_kv
+    query_lens = torch.diff(cu_seqlens_q) #query_start_loc)
 
-    # Ideally we would launch with kernel with:
-    # \sum_i[ceil(query_len[i] / BLOCK_Q)] blocks.
-    # However, it is slow to realize the query_lens on cpu.
-    # Instead we use upper-bound:
-    # \sum_i[ceil(query_len[i] / BLOCK_Q)]
-    #   <= \sum_i[floor(query_len[i] / BLOCK_Q) + 1]
-    #    = \sum_i[floor(query_len[i] / BLOCK_Q)] + num_seqs
-    #   <= floor(\sum_i(query_len[i]) / BLOCK_Q) + num_seqs
-    #    = floor(q.shape[0] / BLOCK_Q) + num_seqs
-    total_num_q_blocks = q.shape[0] // BLOCK_Q + num_seqs
+#    BLOCK_M = 16 if num_queries_per_kv <= 16 else 1 << (num_queries_per_kv - 1).bit_length() # next power of 2 value
+#    BLOCK_Q = BLOCK_M // num_queries_per_kv
+
+#    block_q_seq_boundaries = torch.cumsum(torch.cat([torch.tensor([0], dtype=query_lens.dtype, device=query_lens.device), torch.ceil(query_lens / BLOCK_Q).to(torch.int)]), dim=0)
+#    num_q_blocks = block_q_seq_boundaries[-1].item()
 
     # Assigning default tile sizes for prefill and decode.
     # Note: each tile size must be at least 32 for "fp8" (q.element_size() == 1)
@@ -725,9 +685,9 @@ def unified_attention(
     TILE_SIZE_DECODE = 16 if q.element_size() >= 2 else 32
 
     # if batch contains a prefill
-    if max_seqlen_q > 1 or total_num_q_blocks * num_kv_heads > 128:
+    if max_seqlen_q > 1 or num_q_blocks * num_kv_heads > 128:
         kernel_unified_attention_2d[(
-            total_num_q_blocks,
+            num_q_blocks,
             num_kv_heads,
         )](
             output_ptr=out,
@@ -773,12 +733,13 @@ def unified_attention(
             BLOCK_Q=BLOCK_Q,
             num_seqs=num_seqs,
             BLOCK_M=BLOCK_M,
+            block_q_seq_boundaries_ptr=block_q_seq_boundaries,
             USE_FP8=output_scale is not None,
         )
     else:
         # for initial version, NUM_SEGMENTS = 16 is chosen as a default
         # value that showed good performance in tests
-        NUM_SEGMENTS = 16
+        NUM_SEGMENTS = 64
 
         segm_output = torch.empty(
             q.shape[0],
@@ -804,7 +765,7 @@ def unified_attention(
         )
 
         kernel_unified_attention_3d[(
-            total_num_q_blocks, num_kv_heads, NUM_SEGMENTS)](
+            num_seqs, num_kv_heads, NUM_SEGMENTS)](
                 segm_output_ptr=segm_output,
                 segm_max_ptr=segm_max,
                 segm_expsum_ptr=segm_expsum,
@@ -849,7 +810,7 @@ def unified_attention(
                 BLOCK_M=BLOCK_M,
                 NUM_SEGMENTS_PER_SEQ=NUM_SEGMENTS,
             )
-        reduce_segments[(q.shape[0], num_query_heads)](
+        reduce_segments[(num_seqs, num_query_heads)](
             output_ptr=out,
             segm_output_ptr=segm_output,
             segm_max_ptr=segm_max,

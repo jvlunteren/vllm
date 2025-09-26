@@ -49,6 +49,11 @@ class TritonAttentionMetadata:
     seq_lens: torch.Tensor
     block_table: torch.Tensor
     slot_mapping: torch.Tensor
+    BLOCK_M: int
+    BLOCK_Q: int
+    num_q_blocks: int
+    block_q_seq_boundaries: torch.Tensor
+
 
     # For cascade attention.
     use_cascade: bool
@@ -99,6 +104,16 @@ class TritonAttentionMetadataBuilder(
         max_seq_len = common_attn_metadata.max_seq_len
         query_start_loc = common_attn_metadata.query_start_loc
         seq_lens = common_attn_metadata.seq_lens
+
+        query_lens = torch.diff(query_start_loc)
+        num_queries_per_kv = self.num_heads_q // self.num_heads_kv
+
+        BLOCK_M = 16 if num_queries_per_kv <= 16 else 1 << (num_queries_per_kv - 1).bit_length() # next power of 2 value
+        BLOCK_Q = BLOCK_M // num_queries_per_kv
+
+        block_q_seq_boundaries = torch.cumsum(torch.cat([torch.tensor([0], dtype=query_lens.dtype, device=query_lens.device), torch.ceil(query_lens / BLOCK_Q).to(torch.int)]), dim=0)
+        num_q_blocks = block_q_seq_boundaries[-1].item()
+
         block_table_tensor = common_attn_metadata.block_table_tensor
         slot_mapping = common_attn_metadata.slot_mapping
 
@@ -134,6 +149,10 @@ class TritonAttentionMetadataBuilder(
             prefix_kv_lens=prefix_kv_lens,
             suffix_kv_lens=suffix_kv_lens,
             prefix_scheduler_metadata=prefix_scheduler_metadata,
+            BLOCK_M=BLOCK_M,
+            BLOCK_Q=BLOCK_Q,
+            num_q_blocks=num_q_blocks,
+            block_q_seq_boundaries=block_q_seq_boundaries,
         )
         return attn_metadata
 
@@ -379,6 +398,12 @@ class TritonAttentionImpl(AttentionImpl):
         max_seqlen_k = attn_metadata.max_seq_len
         block_table = attn_metadata.block_table
 
+        BLOCK_M = attn_metadata.BLOCK_M
+        BLOCK_Q = attn_metadata.BLOCK_Q
+
+        num_q_blocks = attn_metadata.num_q_blocks
+        block_q_seq_boundaries = attn_metadata.block_q_seq_boundaries
+
         if use_prefill_decode_attn:
             # Compute attention and update output up to `num_actual_tokens`.
             chunked_prefill_paged_decode(
@@ -425,6 +450,11 @@ class TritonAttentionImpl(AttentionImpl):
                 k_descale=layer._k_scale.expand(descale_shape),
                 v_descale=layer._v_scale.expand(descale_shape),
                 sinks=self.sinks,
-                output_scale=output_scale)
+                output_scale=output_scale,
+                BLOCK_M=BLOCK_M,
+                BLOCK_Q=BLOCK_Q,
+                num_q_blocks=num_q_blocks,
+                block_q_seq_boundaries=block_q_seq_boundaries
+            )
 
         return output
