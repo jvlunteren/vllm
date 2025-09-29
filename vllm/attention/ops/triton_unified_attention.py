@@ -652,7 +652,6 @@ def unified_attention(
     # Optional tensor for sinks
     sinks=None,
 ):
-
     assert causal, "Only causal attention is supported"
     assert q_descale is None, "Q scales not supported"
 
@@ -669,14 +668,6 @@ def unified_attention(
     num_kv_heads = k.shape[2]
     num_queries_per_kv = num_query_heads // num_kv_heads
     head_size = q.shape[2]
-
-    query_lens = torch.diff(cu_seqlens_q) #query_start_loc)
-
-#    BLOCK_M = 16 if num_queries_per_kv <= 16 else 1 << (num_queries_per_kv - 1).bit_length() # next power of 2 value
-#    BLOCK_Q = BLOCK_M // num_queries_per_kv
-
-#    block_q_seq_boundaries = torch.cumsum(torch.cat([torch.tensor([0], dtype=query_lens.dtype, device=query_lens.device), torch.ceil(query_lens / BLOCK_Q).to(torch.int)]), dim=0)
-#    num_q_blocks = block_q_seq_boundaries[-1].item()
 
     # Assigning default tile sizes for prefill and decode.
     # Note: each tile size must be at least 32 for "fp8" (q.element_size() == 1)
@@ -739,7 +730,7 @@ def unified_attention(
     else:
         # for initial version, NUM_SEGMENTS = 16 is chosen as a default
         # value that showed good performance in tests
-        NUM_SEGMENTS = 64
+        NUM_SEGMENTS = 16
 
         segm_output = torch.empty(
             q.shape[0],

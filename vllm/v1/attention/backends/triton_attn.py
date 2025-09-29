@@ -83,6 +83,7 @@ class TritonAttentionMetadataBuilder(
         self.num_heads_kv = model_config.get_num_kv_heads(
             vllm_config.parallel_config)
         self.headdim = model_config.get_head_size()
+        self.block_q_seq_boundaries = torch.empty(513, dtype=torch.int32, device=device)
 
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata
@@ -105,14 +106,19 @@ class TritonAttentionMetadataBuilder(
         query_start_loc = common_attn_metadata.query_start_loc
         seq_lens = common_attn_metadata.seq_lens
 
-        query_lens = torch.diff(query_start_loc)
         num_queries_per_kv = self.num_heads_q // self.num_heads_kv
 
         BLOCK_M = 16 if num_queries_per_kv <= 16 else 1 << (num_queries_per_kv - 1).bit_length() # next power of 2 value
         BLOCK_Q = BLOCK_M // num_queries_per_kv
 
-        block_q_seq_boundaries = torch.cumsum(torch.cat([torch.tensor([0], dtype=query_lens.dtype, device=query_lens.device), torch.ceil(query_lens / BLOCK_Q).to(torch.int)]), dim=0)
-        num_q_blocks = block_q_seq_boundaries[-1].item()
+        self.block_q_seq_boundaries[0] = 0
+        self.block_q_seq_boundaries[1:query_start_loc.numel()].copy_(query_start_loc[1:])
+        self.block_q_seq_boundaries[1:query_start_loc.numel()].sub_(query_start_loc[:-1])
+        self.block_q_seq_boundaries[1:query_start_loc.numel()].add_(BLOCK_Q - 1)
+        self.block_q_seq_boundaries[1:query_start_loc.numel()].floor_divide_(BLOCK_Q)
+        self.block_q_seq_boundaries[:query_start_loc.numel()].cumsum_(dim=0)
+
+        num_q_blocks = self.block_q_seq_boundaries[query_start_loc.numel()-1].item()
 
         block_table_tensor = common_attn_metadata.block_table_tensor
         slot_mapping = common_attn_metadata.slot_mapping
@@ -152,7 +158,7 @@ class TritonAttentionMetadataBuilder(
             BLOCK_M=BLOCK_M,
             BLOCK_Q=BLOCK_Q,
             num_q_blocks=num_q_blocks,
-            block_q_seq_boundaries=block_q_seq_boundaries,
+            block_q_seq_boundaries=self.block_q_seq_boundaries,
         )
         return attn_metadata
 
